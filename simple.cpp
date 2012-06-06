@@ -73,21 +73,36 @@ public:
 	typedef std::vector<seq_t> seqs_t;
 	seqs_t seqs;
 	std::string data;
-	typedef std::vector<const char*> sa_t;
+	typedef std::vector<uint32_t> sa_t;
 	sa_t sa;
 	typedef std::vector<uint32_t> cumulative_t;
 	cumulative_t cumulative;
+	struct match_t {
+		match_t(): ofs(0), len(0), score(0) {}
+		match_t(sa_t::value_type o,uint32_t l,uint32_t s): ofs(o), len(l), score(s) {}
+		sa_t::value_type ofs;
+		uint32_t len;
+		uint32_t score;
+	};
+	typedef std::vector<match_t> matches_t;
 	static genome_t* load_FASTA(const std::string& filename);
-	void save_blossom(const std::string& filename) const;
-	void load_blossom(const std::string& filename);
+	static genome_t* load_blossom(const std::string& filename);
+	void save_to_blossom(const std::string& filename) const;
+	void load_from_blossom(const std::string& filename);
 	virtual ~genome_t() {}
 	void match_FASTQs(const std::string& filename) const;
-	void match(const FASTQ_t& fq) const;
+	void match(const FASTQ_t& fq,matches_t& matches) const;
 private:
 	genome_t(): prefix_len(10) {}
 	int prefix_len;
 	void build_tables();
 };
+
+genome_t* genome_t::load_blossom(const std::string& filename) {
+	std::auto_ptr<genome_t> ret(new genome_t());
+	ret->load_from_blossom(filename);
+	return ret.release();
+}
 
 genome_t* genome_t::load_FASTA(const std::string& filename) {
 	std::auto_ptr<genome_t> ret(new genome_t());
@@ -129,7 +144,7 @@ template<typename T> T read(std::istream& f) { T t; f.read((char*)&t,sizeof(T));
 static const char blossom_signature_text[] = {'b','l','o','s','s','o','m',0};
 static const uint32_t blossom_signature_endian = 0x01F0;
 
-void genome_t::save_blossom(const std::string& filename) const {
+void genome_t::save_to_blossom(const std::string& filename) const {
 	std::ofstream f(filename.c_str());
 	if(!f.is_open()) throw exception_t("could not create blossom file %s",filename.c_str());
 	std::clog << "saving blossom file " << filename << std::endl;
@@ -149,30 +164,62 @@ void genome_t::save_blossom(const std::string& filename) const {
 	f.write(data.c_str(),data.size());
 	write<char>(f,prefix_len);
 	write<uint32_t>(f,sa.size());
-	std::vector<sa_t::value_type> sa_ofs;
-	sa_ofs.reserve(sa.size());
-	for(sa_t::const_iterator i=sa.begin(); i!=sa.end(); i++)
-		sa_ofs.push_back((sa_t::value_type)((*i)-data.c_str()));
-	f.write((const char*)&sa_ofs.front(),sa_ofs.size()*sizeof(sa_t::value_type));
+	f.write((const char*)&sa.front(),sa.size()*sizeof(sa_t::value_type));
 	write<uint32_t>(f,cumulative.size());
 	f.write((const char*)&cumulative.front(),cumulative.size()*sizeof(cumulative_t::value_type));
 }
 
-void genome_t::load_blossom(const std::string& filename) {
+void genome_t::load_from_blossom(const std::string& filename) {
+	std::ifstream f(filename.c_str());
+	if(!f.is_open()) throw exception_t("could not open blossom file %s",filename.c_str());
+	std::clog << "loading blossom file " << filename << std::endl;
+	char sig_check[sizeof(blossom_signature_text)];
+	f.read(sig_check,sizeof(blossom_signature_text));
+	if(memcmp(sig_check,blossom_signature_text,sizeof(blossom_signature_text))) throw exception_t("not a blossom file");
+	if(read<uint32_t>(f) != blossom_signature_endian) throw exception_t("bad blossom endian");
+	if(read<uint8_t>(f) != 1) throw exception_t("bad blossom file version");
+	if(read<uint8_t>(f) != sizeof(sa_t::value_type)) throw exception_t("incompatible blossom SA type");
+	if(read<uint8_t>(f) != sizeof(cumulative_t::value_type)) throw exception_t("incompatible blossom cumulative counter type");
+	// at this point everything seems set up, so go blank everything ready
+	seqs.clear();
+	sa.clear();
+	cumulative.clear();
+	data.clear();
+	// and read it in
+	for(uint32_t num_seqs = read<uint32_t>(f); num_seqs--;) {
+		seq_t seq;
+		seq.name.resize(read<uint32_t>(f));
+		f.read(&seq.name.at(0),seq.name.size());
+		seq.ofs = read<uint32_t>(f);
+		seq.len = read<uint32_t>(f);
+		seqs.push_back(seq);
+	}
+	data.resize(read<uint32_t>(f));
+	f.read(&data.at(0),data.size());
+	prefix_len = read<char>(f);
+	sa.resize(read<uint32_t>(f));
+	f.read((char*)&sa.at(0),sa.size()*sizeof(sa_t::value_type));
+	cumulative.resize(read<uint32_t>(f));
+	f.read((char*)&cumulative.at(0),cumulative.size()*sizeof(cumulative_t::value_type));
+	std::clog << data.size() << " bytes of data, " << sa.size() << " SA entries and " << cumulative.size() << " entries in the cumulative lookup" << std::endl;
 }
 
-static bool str_less(const char *c1, const char *c2) { return strcmp(c1, c2) < 0; }
+struct str_less {
+	str_less(const char* p_): p(p_) {}
+	bool operator()(const genome_t::sa_t::value_type a, const genome_t::sa_t::value_type b) { return strcmp(p+a,p+b) < 0; }
+	const char * const p;
+};
 
 void genome_t::build_tables() {
 	sa.clear();
 	for(seqs_t::const_iterator s=seqs.begin(); s!=seqs.end(); s++) {
 		if(s->len < prefix_len) throw exception_t("sequence %s too short",s->name.c_str());
 		sa.reserve(sa.size() + s->len - prefix_len);
-		for(const char *i=data.c_str()+s->ofs, *const sentinal=data.c_str()+s->ofs+s->len-prefix_len; i<sentinal; i++)
+		for(sa_t::value_type i=s->ofs, sentinal=s->ofs+s->len-prefix_len; i<sentinal; i++)
 			sa.push_back(i);
 	}
 	std::clog << "building suffix array for " << sa.size() << " entries" << std::endl;
-	std::stable_sort(sa.begin(),sa.end(),str_less); // libdivsufsort etc
+	std::stable_sort(sa.begin(),sa.end(),str_less(data.c_str())); // libdivsufsort etc
 	std::clog << "building cumulative array for prefix_len=" << prefix_len << std::endl;
 	cumulative.clear();
 	cumulative.resize(1<<(prefix_len*2),0);
@@ -216,11 +263,16 @@ void genome_t::match_FASTQs(const std::string& filename) const {
 	std::ifstream f(filename.c_str());
 	if(!f.is_open()) throw exception_t("could not load FASTQ %s",filename.c_str());
 	std::clog << "loading FASTQ file " << filename << std::endl;
-	for(std::auto_ptr<FASTQ_t> fq(FASTQ_t::read(f)); fq.get(); fq.reset(FASTQ_t::read(f)))
-		match(*fq);
+	matches_t matches;
+	for(std::auto_ptr<FASTQ_t> fq(FASTQ_t::read(f)); fq.get(); fq.reset(FASTQ_t::read(f))) {
+		matches.clear();
+		match(*fq,matches);
+		for(matches_t::const_iterator i=matches.begin(); i!=matches.end(); i++)
+			std::clog << "\t" << i->ofs << "=" << i->score << (i->len==fq->seq.size()?" EXACT":"") << std::endl;
+	}
 }
 
-void genome_t::match(const FASTQ_t& fq) const {
+void genome_t::match(const FASTQ_t& fq,matches_t& matches) const {
 	std::clog << "matching " << fq.name << std::endl;
 	//http://bowtie-bio.sourceforge.net/manual.shtml#the--n-alignment-mode
 	// exact match
@@ -246,14 +298,14 @@ void genome_t::match(const FASTQ_t& fq) const {
 	cumulative_t::value_type best_ofs;
 	for(cumulative_t::value_type sa_ofs = sa_start; sa_ofs < sa_stop; sa_ofs++) {
 		int match = 0;
-		for(const char* a=fq.seq.c_str(), *b=sa.at(sa_ofs); *a==*b && *a; a++,b++,match++);
+		for(const char* a=fq.seq.c_str(), *b=data.c_str()+sa.at(sa_ofs); *a==*b && *a; a++,b++,match++);
 		if(match > best) {
 			best = match;
 			best_ofs = sa_ofs;
 		}
 	}
 	if(best)
-		std::clog << "\t" << best_ofs << "=" << best << (best==fq.seq.size()?" EXACT":"") << std::endl;
+		matches.push_back(match_t(best_ofs,best,best));
 }
 
 } // namespace blossom
@@ -261,7 +313,8 @@ void genome_t::match(const FASTQ_t& fq) const {
 int main(int argc,char** args) {
 	using namespace blossom;
 	std::auto_ptr<genome_t> e_coli(genome_t::load_FASTA("../bowtie-0.12.8/genomes/NC_008253.fna"));
-	e_coli->save_blossom("e_coli.blossom");
+	e_coli->save_to_blossom("e_coli.blossom");
+	e_coli->load_from_blossom("e_coli.blossom");
 	e_coli->match_FASTQs("../bowtie-0.12.8/reads/e_coli_1000.fq");
 	return 0;
 }
