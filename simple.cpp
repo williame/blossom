@@ -220,6 +220,8 @@ void genome_t::build_tables() {
 	}
 	std::clog << "building suffix array for " << sa.size() << " entries" << std::endl;
 	std::stable_sort(sa.begin(),sa.end(),str_less(data.c_str())); // libdivsufsort etc
+	for(sa_t::iterator i=sa.begin(); i!=sa.end(); i++) // add offset; does this make it a prefix array? :)
+		*i += prefix_len;
 	std::clog << "building cumulative array for prefix_len=" << prefix_len << std::endl;
 	cumulative.clear();
 	cumulative.resize(1<<(prefix_len*2),0);
@@ -263,17 +265,23 @@ void genome_t::match_FASTQs(const std::string& filename) const {
 	std::ifstream f(filename.c_str());
 	if(!f.is_open()) throw exception_t("could not load FASTQ %s",filename.c_str());
 	std::clog << "loading FASTQ file " << filename << std::endl;
+	int exacts = 0;
 	matches_t matches;
 	for(std::auto_ptr<FASTQ_t> fq(FASTQ_t::read(f)); fq.get(); fq.reset(FASTQ_t::read(f))) {
 		matches.clear();
 		match(*fq,matches);
+		bool exact = false;
 		for(matches_t::const_iterator i=matches.begin(); i!=matches.end(); i++)
-			std::clog << "\t" << i->ofs << "=" << i->score << (i->len==fq->seq.size()?" EXACT":"") << std::endl;
+			if(i->len==fq->seq.size()) {
+				std::clog << fq->name << '\t' << i->ofs << std::endl;
+				exact = true;
+			}
+		if(exact) exacts++;
 	}
+	std::clog << exacts << " exact matches" << std::endl;
 }
 
 void genome_t::match(const FASTQ_t& fq,matches_t& matches) const {
-	std::clog << "matching " << fq.name << std::endl;
 	//http://bowtie-bio.sourceforge.net/manual.shtml#the--n-alignment-mode
 	// exact match
 	uint32_t key = 0;
@@ -285,7 +293,7 @@ void genome_t::match(const FASTQ_t& fq,matches_t& matches) const {
 		case 'G': key |= G; break;
 		case 'T': key |= T; break;
 		case 'N': {
-			std::clog << "abandoned unknown" << std::endl;
+			//std::clog << "abandoned unknown" << std::endl;
 			return;
 		} break;
 		default: throw exception_t("bad base %c at FASTQ %d",fq.seq.at(i),i);
@@ -293,15 +301,15 @@ void genome_t::match(const FASTQ_t& fq,matches_t& matches) const {
 		key &= (1<<(prefix_len*2))-1;
 	}
 	const cumulative_t::value_type sa_start = cumulative.at(key), sa_stop = cumulative.at(key+1);
-	std::clog << sa_start << " -> " << sa_stop << " (" << (sa_stop-sa_start) << ") " << fq.seq.size() << ' ' << fq.seq << std::endl;
 	int best = 0;
 	cumulative_t::value_type best_ofs;
 	for(cumulative_t::value_type sa_ofs = sa_start; sa_ofs < sa_stop; sa_ofs++) {
-		int match = 0;
-		for(const char* a=fq.seq.c_str(), *b=data.c_str()+sa.at(sa_ofs); *a==*b && *a; a++,b++,match++);
+		__builtin_prefetch(data.c_str()+sa.at(sa_ofs+1)+prefix_len);
+		int match = prefix_len;
+		for(const char* a=fq.seq.c_str()+prefix_len, *b=data.c_str()+sa.at(sa_ofs); *a==*b && *a; a++,b++,match++);
 		if(match > best) {
 			best = match;
-			best_ofs = sa_ofs;
+			best_ofs = sa.at(sa_ofs)-prefix_len;
 		}
 	}
 	if(best)
@@ -311,10 +319,14 @@ void genome_t::match(const FASTQ_t& fq,matches_t& matches) const {
 } // namespace blossom
 
 int main(int argc,char** args) {
+	std::ios_base::sync_with_stdio(false);	
 	using namespace blossom;
-	std::auto_ptr<genome_t> e_coli(genome_t::load_FASTA("../bowtie-0.12.8/genomes/NC_008253.fna"));
-	e_coli->save_to_blossom("e_coli.blossom");
-	e_coli->load_from_blossom("e_coli.blossom");
+	std::auto_ptr<genome_t> e_coli;
+	if(false) {
+		e_coli.reset(genome_t::load_FASTA("../bowtie-0.12.8/genomes/NC_008253.fna"));
+		e_coli->save_to_blossom("e_coli.blossom");
+	} else
+		e_coli.reset(genome_t::load_blossom("e_coli.blossom"));
 	e_coli->match_FASTQs("../bowtie-0.12.8/reads/e_coli_1000.fq");
 	return 0;
 }
